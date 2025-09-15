@@ -178,7 +178,7 @@ app.get('/', (req, res) => {
       </style>
     </head>
     <body>
-      <h1>CORS Proxy</h1>
+      <h1>adarun</h1>
       <form method="get" action="/proxy">
         <div class="form-group">
           <label for="url">Enter URL to proxy:</label>
@@ -186,6 +186,46 @@ app.get('/', (req, res) => {
         </div>
         <button type="submit">Visit Site</button>
       </form>
+    </body>
+    </html>
+  `);
+});
+// Serve a simple proxy interface
+app.get('/', (req, res) => {
+  res.send(`
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <title>CORS Proxy</title>
+      <style>
+        body { font-family: Arial, sans-serif; max-width: 900px; margin: 0 auto; padding: 20px; }
+        h1 { margin-bottom: 10px; }
+        form { display: flex; gap: 10px; margin-bottom: 20px; }
+        input[type="url"] { flex: 1; padding: 10px; font-size: 16px; border: 1px solid #ccc; border-radius: 6px; }
+        button { background: #007bff; color: white; padding: 10px 20px; border: none; border-radius: 6px; cursor: pointer; font-size: 16px; }
+        button:hover { background: #0056b3; }
+        iframe { width: 100%; height: 80vh; border: 1px solid #ccc; border-radius: 6px; }
+      </style>
+    </head>
+    <body>
+      <h1>CORS Proxy</h1>
+      <form id="proxyForm">
+        <input type="url" id="urlInput" placeholder="https://example.com" required>
+        <button type="submit">Go</button>
+      </form>
+      <iframe id="proxyFrame" src="" title="Proxied site"></iframe>
+
+      <script>
+        const form = document.getElementById('proxyForm');
+        const input = document.getElementById('urlInput');
+        const frame = document.getElementById('proxyFrame');
+
+        form.addEventListener('submit', (e) => {
+          e.preventDefault();
+          const url = encodeURIComponent(input.value);
+          frame.src = '/proxy?url=' + url;
+        });
+      </script>
     </body>
     </html>
   `);

@@ -19,6 +19,34 @@ function log(...args) {
   console.log(new Date().toISOString(), ...args);
 }
 
+// Function to check if a URL belongs to the same domain/subdomain
+function isSameDomainOrSubdomain(targetUrl, baseUrl) {
+  try {
+    const targetHost = new URL(targetUrl).hostname;
+    const baseHost = new URL(baseUrl).hostname;
+    
+    // Extract root domain (handle cases like www.example.com -> example.com)
+    const getRootDomain = (hostname) => {
+      const parts = hostname.split('.');
+      if (parts.length >= 2) {
+        return parts.slice(-2).join('.');
+      }
+      return hostname;
+    };
+    
+    const targetRoot = getRootDomain(targetHost);
+    const baseRoot = getRootDomain(baseHost);
+    
+    // Check if same root domain or subdomain
+    return targetHost === baseHost || 
+           targetHost.endsWith('.' + baseHost) || 
+           baseHost.endsWith('.' + targetHost) ||
+           targetRoot === baseRoot;
+  } catch (error) {
+    return false;
+  }
+}
+
 // Function to resolve relative URLs to absolute URLs
 function resolveUrl(baseUrl, relativeUrl) {
   try {
@@ -85,6 +113,11 @@ function rewriteHtml(html, baseUrl, proxyBaseUrl) {
         // Resolve to absolute URL
         const absoluteUrl = resolveUrl(baseUrl, url);
         
+        // Only proxy if it's a valid HTTP(S) URL
+        if (!/^https?:\/\//.test(absoluteUrl)) {
+          return match;
+        }
+        
         // Create proxy URL
         const proxyUrl = `${proxyBaseUrl}/proxy?url=${encodeURIComponent(absoluteUrl)}`;
         
@@ -96,6 +129,29 @@ function rewriteHtml(html, baseUrl, proxyBaseUrl) {
     });
   });
   
+  // Handle srcset attributes with multiple URLs
+  rewrittenHtml = rewrittenHtml.replace(/(<(?:img|source)[^>]*\ssrcset\s*=\s*["'])([^"']+)(["'])/gi, (match, prefix, srcset, suffix) => {
+    try {
+      // srcset format: "url1 1x, url2 2x" or "url1 100w, url2 200w"
+      const rewrittenSrcset = srcset.split(',').map(part => {
+        const [url, ...descriptors] = part.trim().split(/\s+/);
+        const absoluteUrl = resolveUrl(baseUrl, url);
+        
+        if (!/^https?:\/\//.test(absoluteUrl)) {
+          return part.trim();
+        }
+        
+        const proxyUrl = `${proxyBaseUrl}/proxy?url=${encodeURIComponent(absoluteUrl)}`;
+        return [proxyUrl, ...descriptors].join(' ');
+      }).join(', ');
+      
+      return `${prefix}${rewrittenSrcset}${suffix}`;
+    } catch (error) {
+      log('Srcset rewrite error:', error.message);
+      return match;
+    }
+  });
+  
   // Handle CSS url() references
   rewrittenHtml = rewrittenHtml.replace(/url\s*\(\s*["']?([^"')]+)["']?\s*\)/gi, (match, url) => {
     try {
@@ -104,6 +160,11 @@ function rewriteHtml(html, baseUrl, proxyBaseUrl) {
       }
       
       const absoluteUrl = resolveUrl(baseUrl, url);
+      
+      if (!/^https?:\/\//.test(absoluteUrl)) {
+        return match;
+      }
+      
       const proxyUrl = `${proxyBaseUrl}/proxy?url=${encodeURIComponent(absoluteUrl)}`;
       return `url("${proxyUrl}")`;
     } catch (error) {
@@ -130,7 +191,78 @@ function rewriteHtml(html, baseUrl, proxyBaseUrl) {
   // Inject base tag to help with relative URLs
   const baseTag = `<base href="${baseUrl}">`;
   if (!rewrittenHtml.includes('<base')) {
-    rewrittenHtml = rewrittenHtml.replace('<head>', `<head>\n${baseTag}`);
+    rewrittenHtml = rewrittenHtml.replace(/<head>/i, `<head>\n${baseTag}`);
+  }
+  
+  // Inject script to intercept fetch/XHR for all external requests
+  const interceptScript = `
+    <script>
+      (function() {
+        const proxyBaseUrl = '${proxyBaseUrl}';
+        const originalFetch = window.fetch;
+        const originalXHROpen = XMLHttpRequest.prototype.open;
+        
+        // Intercept fetch
+        window.fetch = function(url, options = {}) {
+          try {
+            let targetUrl = url;
+            if (typeof url === 'object' && url.url) {
+              targetUrl = url.url;
+            }
+            
+            // Convert relative URLs to absolute using the base URL
+            if (!/^https?:\\/\\//.test(targetUrl)) {
+              const baseHref = document.querySelector('base')?.href || '${baseUrl}';
+              targetUrl = new URL(targetUrl, baseHref).href;
+            }
+            
+            // Check if URL needs proxying (any HTTP(S) URL that's not already proxied)
+            if (/^https?:\\/\\//.test(targetUrl) && !targetUrl.includes('/proxy?url=')) {
+              const urlObj = new URL(targetUrl);
+              if (urlObj.origin !== proxyBaseUrl) {
+                const proxyUrl = proxyBaseUrl + '/proxy?url=' + encodeURIComponent(targetUrl);
+                return originalFetch.call(this, proxyUrl, options);
+              }
+            }
+          } catch (e) {
+            console.error('Fetch intercept error:', e);
+          }
+          return originalFetch.call(this, url, options);
+        };
+        
+        // Intercept XMLHttpRequest
+        XMLHttpRequest.prototype.open = function(method, url, ...rest) {
+          try {
+            let targetUrl = url;
+            
+            // Convert relative URLs to absolute
+            if (!/^https?:\\/\\//.test(targetUrl)) {
+              const baseHref = document.querySelector('base')?.href || '${baseUrl}';
+              targetUrl = new URL(targetUrl, baseHref).href;
+            }
+            
+            // Check if URL needs proxying (any HTTP(S) URL that's not already proxied)
+            if (/^https?:\\/\\//.test(targetUrl) && !targetUrl.includes('/proxy?url=')) {
+              const urlObj = new URL(targetUrl);
+              if (urlObj.origin !== proxyBaseUrl) {
+                const proxyUrl = proxyBaseUrl + '/proxy?url=' + encodeURIComponent(targetUrl);
+                return originalXHROpen.call(this, method, proxyUrl, ...rest);
+              }
+            }
+          } catch (e) {
+            console.error('XHR intercept error:', e);
+          }
+          return originalXHROpen.call(this, method, url, ...rest);
+        };
+      })();
+    </script>
+  `;
+  
+  // Inject the script before closing </head> or </body>
+  if (rewrittenHtml.includes('</head>')) {
+    rewrittenHtml = rewrittenHtml.replace('</head>', `${interceptScript}\n</head>`);
+  } else if (rewrittenHtml.includes('</body>')) {
+    rewrittenHtml = rewrittenHtml.replace('</body>', `${interceptScript}\n</body>`);
   }
   
   return rewrittenHtml;
@@ -148,6 +280,11 @@ function rewriteCss(css, baseUrl, proxyBaseUrl) {
       }
       
       const absoluteUrl = resolveUrl(baseUrl, url);
+      
+      if (!/^https?:\/\//.test(absoluteUrl)) {
+        return match;
+      }
+      
       const proxyUrl = `${proxyBaseUrl}/proxy?url=${encodeURIComponent(absoluteUrl)}`;
       return `url("${proxyUrl}")`;
     } catch (error) {
@@ -162,34 +299,6 @@ app.get('/healthz', (req, res) => {
   res.json({ ok: true, time: new Date().toISOString() });
 });
 
-// Serve a simple proxy interface
-app.get('/', (req, res) => {
-  res.send(`
-    <!DOCTYPE html>
-    <html>
-    <head>
-      <title>CORS Proxy</title>
-      <style>
-        body { font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; }
-        .form-group { margin-bottom: 15px; }
-        input[type="url"] { width: 100%; padding: 10px; font-size: 16px; }
-        button { background: #007bff; color: white; padding: 10px 20px; border: none; cursor: pointer; }
-        button:hover { background: #0056b3; }
-      </style>
-    </head>
-    <body>
-      <h1>adarun</h1>
-      <form method="get" action="/proxy">
-        <div class="form-group">
-          <label for="url">Enter URL to proxy:</label>
-          <input type="url" name="url" id="url" placeholder="https://example.com" required>
-        </div>
-        <button type="submit">Visit Site</button>
-      </form>
-    </body>
-    </html>
-  `);
-});
 // Serve a simple proxy interface
 app.get('/', (req, res) => {
   res.send(`
@@ -295,7 +404,7 @@ app.get('/proxy', async (req, res) => {
     
     headersToForward2.forEach(header => {
       const value = response.headers.get(header);
-      if (value && header !== 'content-length') { // Don't forward content-length as it may change
+      if (value && header !== 'content-length') {
         res.set(header, value);
       }
     });
@@ -312,7 +421,7 @@ app.get('/proxy', async (req, res) => {
       const rewrittenCss = rewriteCss(css, targetUrl, proxyBaseUrl);
       res.send(rewrittenCss);
     } else if (contentType.includes('application/javascript') || contentType.includes('text/javascript')) {
-      // JavaScript content - pass through (could add URL rewriting here too)
+      // JavaScript content - pass through
       const js = await response.text();
       res.send(js);
     } else if (contentType.includes('application/json') || contentType.includes('application/xml') || contentType.includes('text/')) {
@@ -361,7 +470,7 @@ app.post('/proxy', async (req, res) => {
     
     res.status(response.status);
     
-    // Copy headers (excluding CORS headers)
+    // Copy headers
     response.headers.forEach((value, name) => {
       if (!name.toLowerCase().startsWith('access-control-') && name.toLowerCase() !== 'content-length') {
         res.set(name, value);
@@ -444,5 +553,5 @@ app.listen(PORT, () => {
   log(`CORS Proxy server running on port ${PORT}`);
   log('Usage: GET /proxy?url=<encoded-url>');
   log('Web interface available at: http://localhost:' + PORT);
-  log('Full site proxying enabled with URL rewriting');
+  log('Full site proxying with automatic cross-domain support enabled');
 });
